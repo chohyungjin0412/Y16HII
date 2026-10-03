@@ -1,0 +1,94 @@
+name: Build Y16HII IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: xcode-27
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Find and extract Swift Playgrounds ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$(find . -maxdepth 2 -type f -name '*.zip' -print -quit)"
+          if [ -z "$ZIP" ]; then
+            echo "No .zip file found in the repository."
+            exit 1
+          fi
+
+          echo "Using ZIP: $ZIP"
+          rm -rf extracted
+          mkdir -p extracted
+          ditto -x -k "$ZIP" extracted
+
+          PACKAGE_SWIFT="$(find extracted -type f -name Package.swift -print -quit)"
+          if [ -z "$PACKAGE_SWIFT" ]; then
+            echo "Package.swift was not found after extraction."
+            find extracted -maxdepth 5 -print
+            exit 1
+          fi
+
+          PACKAGE_DIR="$(dirname "$PACKAGE_SWIFT")"
+          echo "PACKAGE_DIR=$GITHUB_WORKSPACE/$PACKAGE_DIR" >> "$GITHUB_ENV"
+          echo "Package directory: $PACKAGE_DIR"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Inspect Swift package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_DIR"
+          echo "Working directory: $PWD"
+          echo "=== xcodebuild -list ==="
+          xcodebuild -list
+
+      - name: Build Swift Playgrounds App
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/build"
+
+          cd "$PACKAGE_DIR"
+
+          xcodebuild             -scheme "Y16HII"             -configuration Release             -sdk iphoneos             -destination "generic/platform=iOS"             -derivedDataPath "$GITHUB_WORKSPACE/build"             CODE_SIGNING_ALLOWED=NO             CODE_SIGNING_REQUIRED=NO             build
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(find "$GITHUB_WORKSPACE/build/Build/Products"             -type d -name '*.app' -print -quit)"
+
+          if [ -z "$APP" ]; then
+            echo "No .app was produced."
+            find "$GITHUB_WORKSPACE/build" -type d -name '*.app' -print || true
+            exit 1
+          fi
+
+          echo "APP=$APP"
+
+          rm -rf "$GITHUB_WORKSPACE/Payload"
+          mkdir -p "$GITHUB_WORKSPACE/Payload"
+          cp -R "$APP" "$GITHUB_WORKSPACE/Payload/"
+
+          cd "$GITHUB_WORKSPACE"
+          zip -qry "Y16HII-unsigned.ipa" Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Y16HII-unsigned-ipa
+          path: Y16HII-unsigned.ipa
+          if-no-files-found: error
