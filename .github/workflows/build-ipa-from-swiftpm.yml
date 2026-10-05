@@ -1,0 +1,85 @@
+name: Build IPA from SwiftPM Project
+
+on:
+  push:
+    paths:
+      - '**/*.swiftpm/**'
+      - '**/Package.swift'
+      - '.github/workflows/build-ipa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Find SwiftPM project
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_SWIFT=$(find . -type f -name Package.swift -not -path './.git/*' | head -n 1)
+          if [ -z "$PACKAGE_SWIFT" ]; then
+            echo 'Package.swift를 찾지 못했습니다.'
+            exit 1
+          fi
+          PACKAGE_DIR=$(dirname "$PACKAGE_SWIFT")
+          echo "package_dir=$PACKAGE_DIR" >> "$GITHUB_OUTPUT"
+          echo "Found: $PACKAGE_DIR"
+
+      - name: Build unsigned app
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_DIR='${{ steps.find.outputs.package_dir }}'
+          cd "$PACKAGE_DIR"
+          xcodebuild -list
+          xcodebuild \
+            -scheme "Y16HII" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package IPA
+        id: ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' -type d | head -n 1)
+          if [ -z "$APP" ]; then
+            echo '.app를 찾지 못했습니다.'
+            exit 1
+          fi
+          rm -rf "$GITHUB_WORKSPACE/Payload"
+          mkdir -p "$GITHUB_WORKSPACE/Payload"
+          cp -R "$APP" "$GITHUB_WORKSPACE/Payload/"
+          cd "$GITHUB_WORKSPACE"
+          VERSION=$(date '+%Y.%m.%d.%H%M')
+          IPA="Y16HII-${VERSION}.ipa"
+          zip -qry "$IPA" Payload
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Y16HII-IPA
+          path: ${{ steps.ipa.outputs.ipa }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-${{ steps.ipa.outputs.version }}
+          name: Y16HII IPA ${{ steps.ipa.outputs.version }}
+          files: ${{ steps.ipa.outputs.ipa }}
+          generate_release_notes: false
