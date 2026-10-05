@@ -1,85 +1,216 @@
-name: Build IPA from SwiftPM Project
+name: Build IPA
 
 on:
   push:
     paths:
-      - '**/*.swiftpm/**'
-      - '**/Package.swift'
-      - '.github/workflows/build-ipa.yml'
-  workflow_dispatch:
+      - "*.zip"
+      - ".github/workflows/build-ipa.yml"
 
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-27
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+    runs-on: macos-15
 
-      - name: Find SwiftPM project
-        id: find
+    steps:
+      # 1. 저장소 가져오기
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Xcode 확인
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+          swift --version
+
+      # 3. XcodeGen 설치
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+
+      # 4. 최상위 ZIP 찾기
+      - name: Find Swift Package ZIP
+        id: zip
         shell: bash
         run: |
-          set -euo pipefail
-          PACKAGE_SWIFT=$(find . -type f -name Package.swift -not -path './.git/*' | head -n 1)
-          if [ -z "$PACKAGE_SWIFT" ]; then
-            echo 'Package.swift를 찾지 못했습니다.'
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "❌ 최상위 폴더에서 ZIP 파일을 찾지 못했습니다."
             exit 1
           fi
-          PACKAGE_DIR=$(dirname "$PACKAGE_SWIFT")
-          echo "package_dir=$PACKAGE_DIR" >> "$GITHUB_OUTPUT"
-          echo "Found: $PACKAGE_DIR"
 
-      - name: Build unsigned app
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "📦 Package: $ZIP_FILE"
+
+      # 5. ZIP 압축 해제
+      - name: Extract Swift Package
+        run: |
+          rm -rf Package
+          mkdir Package
+
+          unzip -q "${{ steps.zip.outputs.ZIP_FILE }}" -d Package
+
+          echo "📂 Extracted files:"
+          find Package -maxdepth 4 -type f | sort
+
+      # 6. Package.swift 찾기
+      - name: Find Package.swift
+        id: package
         shell: bash
         run: |
-          set -euo pipefail
-          PACKAGE_DIR='${{ steps.find.outputs.package_dir }}'
-          cd "$PACKAGE_DIR"
-          xcodebuild -list
+          PACKAGE_SWIFT=$(find Package -name "Package.swift" -type f | head -n 1)
+
+          if [ -z "$PACKAGE_SWIFT" ]; then
+            echo "❌ Package.swift를 찾지 못했습니다."
+            exit 1
+          fi
+
+          PACKAGE_DIR=$(dirname "$PACKAGE_SWIFT")
+
+          echo "PACKAGE_SWIFT=$PACKAGE_SWIFT" >> "$GITHUB_OUTPUT"
+          echo "PACKAGE_DIR=$PACKAGE_DIR" >> "$GITHUB_OUTPUT"
+
+          echo "📦 Package.swift: $PACKAGE_SWIFT"
+          echo "📁 Package directory: $PACKAGE_DIR"
+
+      # 7. Swift Package 구조 확인
+      - name: Inspect Swift Package
+        working-directory: ${{ steps.package.outputs.PACKAGE_DIR }}
+        run: |
+          swift package dump-package
+
+      # 8. Swift Package 의존성 가져오기
+      - name: Resolve Swift Package
+        working-directory: ${{ steps.package.outputs.PACKAGE_DIR }}
+        run: |
+          swift package resolve
+
+      # 9. Package를 사용할 iOS App 생성
+      - name: Generate iOS App Project
+        shell: bash
+        run: |
+          mkdir -p App
+
+          cat > App/ContentView.swift <<'SWIFT'
+          import SwiftUI
+
+          struct ContentView: View {
+              var body: some View {
+                  Text("SwiftPM App")
+                      .padding()
+              }
+          }
+
+          #Preview {
+              ContentView()
+          }
+          SWIFT
+
+          cat > App/App.swift <<'SWIFT'
+          import SwiftUI
+
+          @main
+          struct GeneratedApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+          SWIFT
+
+          cat > App/project.yml <<'YAML'
+          name: GeneratedApp
+
+          options:
+            deploymentTarget:
+              iOS: "17.0"
+
+          packages:
+            LocalPackage:
+              path: ../Package
+
+          targets:
+            GeneratedApp:
+              type: application
+              platform: iOS
+
+              sources:
+                - path: App
+
+              dependencies:
+                - package: LocalPackage
+
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.generated.app
+                  INFOPLIST_KEY_CFBundleDisplayName: GeneratedApp
+                  INFOPLIST_KEY_LSRequiresIPhoneOS: YES
+                  SWIFT_VERSION: 5.0
+
+          YAML
+
+          cd App
+          xcodegen generate
+
+          echo "📂 Generated project:"
+          find . -maxdepth 3 -type f | sort
+
+      # 10. Swift Package를 실제로 빌드할 수 있는지 확인
+      - name: Build Swift Package
+        working-directory: ${{ steps.package.outputs.PACKAGE_DIR }}
+        run: |
+          swift build
+
+      # 11. Archive
+      - name: Archive iOS App
+        run: |
           xcodebuild \
-            -scheme "Y16HII" \
-            -configuration Release \
+            -project App/GeneratedApp.xcodeproj \
+            -scheme GeneratedApp \
             -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            -configuration Release \
+            -archivePath "$PWD/GeneratedApp.xcarchive" \
+            -destination "generic/platform=iOS" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build
+            archive
 
-      - name: Package IPA
-        id: ipa
-        shell: bash
+      # 12. .app 추출
+      - name: Extract App
         run: |
-          set -euo pipefail
-          APP=$(find "$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' -type d | head -n 1)
-          if [ -z "$APP" ]; then
-            echo '.app를 찾지 못했습니다.'
+          mkdir -p Payload
+
+          APP_PATH=$(find GeneratedApp.xcarchive/Products/Applications \
+            -maxdepth 1 \
+            -name "*.app" \
+            -type d | head -n 1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ .app을 찾지 못했습니다."
             exit 1
           fi
-          rm -rf "$GITHUB_WORKSPACE/Payload"
-          mkdir -p "$GITHUB_WORKSPACE/Payload"
-          cp -R "$APP" "$GITHUB_WORKSPACE/Payload/"
-          cd "$GITHUB_WORKSPACE"
-          VERSION=$(date '+%Y.%m.%d.%H%M')
-          IPA="Y16HII-${VERSION}.ipa"
-          zip -qry "$IPA" Payload
-          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Upload IPA artifact
+          cp -R "$APP_PATH" Payload/
+
+          echo "📱 App:"
+          find Payload -maxdepth 2 -type f | head
+
+      # 13. IPA 생성
+      - name: Create IPA
+        run: |
+          zip -qry GeneratedApp.ipa Payload
+
+          echo "✅ IPA created:"
+          ls -lh GeneratedApp.ipa
+
+      # 14. IPA를 GitHub Actions Artifact로 업로드
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Y16HII-IPA
-          path: ${{ steps.ipa.outputs.ipa }}
+          name: GeneratedApp-IPA
+          path: GeneratedApp.ipa
           if-no-files-found: error
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ipa-${{ steps.ipa.outputs.version }}
-          name: Y16HII IPA ${{ steps.ipa.outputs.version }}
-          files: ${{ steps.ipa.outputs.ipa }}
-          generate_release_notes: false
+          retention-days: 30
