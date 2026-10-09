@@ -1,0 +1,157 @@
+name: Build IPA from SwiftPM ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: 'Optional Xcode scheme (leave blank to auto-detect)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Find and extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t ZIPS < <(find "$GITHUB_WORKSPACE" -type f -name '*.zip' -not -path '*/.git/*' -not -path '*/extracted/*' -print)
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "ERROR: No ZIP file found. Put one SwiftPM project ZIP in the repository."
+            exit 1
+          fi
+          if [ "${#ZIPS[@]}" -gt 1 ]; then
+            printf 'ERROR: Found multiple ZIP files. Keep only one project ZIP:\n%s\n' "${ZIPS[@]}"
+            exit 1
+          fi
+          ZIP="${ZIPS[0]}"
+          echo "Using ZIP: $ZIP"
+          mkdir -p "$GITHUB_WORKSPACE/extracted"
+          ditto -x -k "$ZIP" "$GITHUB_WORKSPACE/extracted"
+
+          mapfile -t PACKAGES < <(find "$GITHUB_WORKSPACE/extracted" -type f -name Package.swift -not -path '*/.build/*' -print)
+          if [ "${#PACKAGES[@]}" -eq 0 ]; then
+            echo "ERROR: No Package.swift found inside ZIP."
+            find "$GITHUB_WORKSPACE/extracted" -maxdepth 5 -print
+            exit 1
+          fi
+          if [ "${#PACKAGES[@]}" -gt 1 ]; then
+            printf 'ERROR: Multiple Package.swift files found; cannot safely choose a project:\n%s\n' "${PACKAGES[@]}"
+            echo "Please ZIP one app project at a time."
+            exit 1
+          fi
+          PACKAGE_DIR="$(dirname "${PACKAGES[0]}")"
+          echo "PACKAGE_DIR=$PACKAGE_DIR" >> "$GITHUB_ENV"
+          echo "Detected SwiftPM package: $PACKAGE_DIR"
+
+      - name: Show Xcode toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Resolve package and detect schemes
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_DIR"
+          xcodebuild -resolvePackageDependencies
+          xcodebuild -list -json > "$RUNNER_TEMP/xcode-list.json"
+          python3 - "$RUNNER_TEMP/xcode-list.json" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          root = data.get("workspace", data.get("project", data.get("package", data)))
+          schemes = root.get("schemes", [])
+          if not schemes:
+              raise SystemExit("ERROR: Xcode reported no build schemes for this SwiftPM package.")
+          PY
+          echo "Available schemes:"
+          cat "$RUNNER_TEMP/xcode-list.json"
+
+      - name: Build an app scheme automatically
+        shell: bash
+        env:
+          REQUESTED_SCHEME: ${{ inputs.scheme }}
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_DIR"
+          rm -rf "$GITHUB_WORKSPACE/build"
+
+          python3 - "$RUNNER_TEMP/xcode-list.json" "$REQUESTED_SCHEME" > "$RUNNER_TEMP/schemes.txt" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          root = data.get("workspace", data.get("project", data.get("package", data)))
+          schemes = root.get("schemes", [])
+          requested = sys.argv[2].strip()
+          if requested:
+              if requested not in schemes:
+                  raise SystemExit(f"ERROR: Requested scheme '{requested}' not found. Available: {', '.join(schemes)}")
+              schemes = [requested]
+          for scheme in schemes:
+              print(scheme)
+          PY
+
+          SUCCESS=0
+          while IFS= read -r SCHEME; do
+            [ -n "$SCHEME" ] || continue
+            echo "===== Trying scheme: $SCHEME ====="
+            if xcodebuild \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$GITHUB_WORKSPACE/build" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              build; then
+              APP="$(find "$GITHUB_WORKSPACE/build/Build/Products" -type d -name '*.app' -print -quit 2>/dev/null || true)"
+              if [ -n "$APP" ]; then
+                echo "Built app: $APP"
+                echo "$APP" > "$GITHUB_WORKSPACE/app-path.txt"
+                echo "$SCHEME" > "$GITHUB_WORKSPACE/scheme-used.txt"
+                SUCCESS=1
+                break
+              fi
+              echo "Scheme built but did not produce an .app; trying next scheme."
+            else
+              echo "Scheme '$SCHEME' failed; trying next scheme."
+            fi
+            rm -rf "$GITHUB_WORKSPACE/build"
+          done < "$RUNNER_TEMP/schemes.txt"
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "ERROR: No scheme produced an iOS .app. If this package has multiple schemes, rerun and enter the app scheme in the workflow input."
+            exit 1
+          fi
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(cat "$GITHUB_WORKSPACE/app-path.txt")"
+          APP_NAME="$(basename "$APP" .app)"
+          rm -rf "$GITHUB_WORKSPACE/Payload"
+          mkdir -p "$GITHUB_WORKSPACE/Payload"
+          ditto "$APP" "$GITHUB_WORKSPACE/Payload/$APP_NAME.app"
+          cd "$GITHUB_WORKSPACE"
+          zip -qry "${APP_NAME}-unsigned.ipa" Payload
+          echo "IPA_PATH=$GITHUB_WORKSPACE/${APP_NAME}-unsigned.ipa" >> "$GITHUB_ENV"
+          echo "Created unsigned IPA: ${APP_NAME}-unsigned.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 14
